@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# Local environments and generated runtime data
+work/
+.venv/
+
+# Optional local upstream checkout. The app installs ARIADNE from GitHub.
+astroariadne/
+
+# Streamlit local configuration
+.streamlit/secrets.toml
