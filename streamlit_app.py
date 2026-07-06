@@ -17,6 +17,7 @@ import plotly.express as px
 import requests
 import streamlit as st
 from astropy.coordinates import SkyCoord
+from astropy.io.votable import parse_single_table
 from astroquery.ipac.irsa import Irsa
 from astroquery.simbad import Simbad
 from dustmaps.config import config as dustmaps_config
@@ -73,6 +74,11 @@ DISPLAY_NAMES = {
     "WISE_RSR_W1": "WISE W1",
     "WISE_RSR_W2": "WISE W2",
 }
+
+GAIA_TAP_SERVICES = [
+    ("ESA Gaia Archive", "https://gea.esac.esa.int/tap-server/tap/sync", "json"),
+    ("Gaia@AIP", "https://gaia.aip.de/tap/sync", "votable"),
+]
 
 
 st.set_page_config(
@@ -392,20 +398,58 @@ def download_observables(ra_deg: float, dec_deg: float, gaia_dr3_id: int | None)
     }
 
 
+def _response_excerpt(response: requests.Response, limit: int = 240) -> str:
+    text = response.text.strip()
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[:limit] or "<empty response>"
+
+
+def _coerce_tap_value(value):
+    if value is np.ma.masked:
+        return None
+    with contextlib.suppress(Exception):
+        if np.ma.is_masked(value):
+            return None
+    with contextlib.suppress(Exception):
+        return value.item()
+    return value
+
+
+def _votable_rows(content: bytes) -> list:
+    table = parse_single_table(io.BytesIO(content)).to_table()
+    return [[_coerce_tap_value(row[name]) for name in table.colnames] for row in table]
+
+
 def run_gaia_tap_json(query: str, timeout: int = 30) -> list:
-    response = requests.post(
-        "https://gea.esac.esa.int/tap-server/tap/sync",
-        data={
-            "REQUEST": "doQuery",
-            "LANG": "ADQL",
-            "FORMAT": "json",
-            "QUERY": query,
-        },
-        timeout=timeout,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    return payload.get("data", [])
+    errors = []
+    for service_name, url, response_format in GAIA_TAP_SERVICES:
+        try:
+            response = requests.post(
+                url,
+                data={
+                    "REQUEST": "doQuery",
+                    "LANG": "ADQL",
+                    "FORMAT": response_format,
+                    "QUERY": query,
+                },
+                timeout=timeout,
+            )
+            response.raise_for_status()
+
+            if response_format == "json":
+                content_type = response.headers.get("content-type", "")
+                if "json" not in content_type.lower() and not response.text.lstrip().startswith("{"):
+                    errors.append(f"{service_name} returned non-JSON: {_response_excerpt(response)}")
+                    continue
+                payload = response.json()
+                return payload.get("data", [])
+
+            return _votable_rows(response.content)
+        except Exception as exc:
+            errors.append(f"{service_name}: {exc}")
+
+    raise RuntimeError("Gaia TAP query failed. " + " | ".join(errors))
 
 
 def fetch_sfd_dustmap() -> None:
