@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parent
 RUNS_DIR = ROOT / "work" / "streamlit-runs"
 DUSTMAP_DIR = ROOT / "work" / "dustmaps"
 PC_TO_LY = 3.261563777
-APP_VERSION = "0.1.3-dev"
+APP_VERSION = "0.2"
 SPECTRA_CACHE_SIZE = "~2.8 GB / 2.6 GiB"
 SOLAR_RADIUS = "R\u2299"
 SOLAR_MASS = "M\u2299"
@@ -95,6 +95,18 @@ dustmaps_config["data_dir"] = str(DUSTMAP_DIR)
 
 def spectra_cache_path() -> Path:
     return ROOT / "astroariadne" / "astroARIADNE" / "Datafiles" / "spectra_cache.h5"
+
+
+def spectra_cache_part_path() -> Path:
+    return spectra_cache_path().with_name(f"{spectra_cache_path().name}.part")
+
+
+def _format_download_size(size: int) -> str:
+    if size >= 1_000_000_000:
+        return f"{size / 1_000_000_000:.2f} GB"
+    if size >= 1_000_000:
+        return f"{size / 1_000_000:.0f} MB"
+    return f"{size / 1_000:.0f} KB"
 
 
 def _configure_spectra_cache() -> Path | None:
@@ -194,24 +206,89 @@ def _import_ariadne():
 
 def fetch_spectra_cache() -> Path:
     _import_ariadne()
-    from astroARIADNE.fetch import fetch_spectra_cache as fetch
+    from astroARIADNE import fetch as ariadne_fetch
 
-    return Path(fetch())
+    dest = spectra_cache_path()
+    if dest.exists():
+        _configure_spectra_cache()
+        return dest
+
+    tmp = spectra_cache_part_path()
+    downloaded = tmp.stat().st_size if tmp.exists() else 0
+    headers = {"Range": f"bytes={downloaded}-"} if downloaded else {}
+
+    progress = st.progress(0, text="Preparing spectra cache download...")
+    status = st.empty()
+
+    with requests.get(ariadne_fetch._download_url(), headers=headers, stream=True, timeout=(30, 120)) as response:
+        if downloaded and response.status_code == 200:
+            downloaded = 0
+            tmp.unlink(missing_ok=True)
+        response.raise_for_status()
+
+        total_remaining = int(response.headers.get("content-length", 0))
+        total_size = downloaded + total_remaining if response.status_code == 206 else total_remaining
+        mode = "ab" if downloaded else "wb"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+
+        with tmp.open(mode) as file:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if not chunk:
+                    continue
+                file.write(chunk)
+                downloaded += len(chunk)
+                if total_size:
+                    fraction = min(downloaded / total_size, 1.0)
+                    progress.progress(
+                        fraction,
+                        text=(
+                            f"Downloading optional spectra cache: {fraction:.0%} "
+                            f"({_format_download_size(downloaded)} / {_format_download_size(total_size)})"
+                        ),
+                    )
+                else:
+                    status.info(f"Downloaded {_format_download_size(downloaded)}...")
+
+    if ariadne_fetch.ZENODO_SHA256 is not None:
+        progress.progress(1.0, text="Verifying optional spectra cache checksum...")
+        actual = ariadne_fetch._sha256(tmp)
+        if actual != ariadne_fetch.ZENODO_SHA256:
+            tmp.unlink(missing_ok=True)
+            raise RuntimeError(
+                f"SHA-256 mismatch: expected {ariadne_fetch.ZENODO_SHA256}, got {actual}"
+            )
+
+    tmp.replace(dest)
+    _configure_spectra_cache()
+    progress.progress(1.0, text="Optional spectra cache installed.")
+    status.empty()
+    return dest
 
 
 def render_spectra_cache_button(key: str) -> None:
-    if spectra_cache_path().exists():
-        st.success("ARIADNE spectra cache is installed.")
-        return
+    cache_installed = spectra_cache_path().exists()
+    partial_cache = spectra_cache_part_path()
 
     st.info(
         f"The continuous fitted SED model curve needs ARIADNE's optional spectra cache ({SPECTRA_CACHE_SIZE}). "
         "It is not required for the fit itself, parameter tables, corner plots, or Bayesian Model Averaging (BMA) histograms."
     )
-    if st.button(f"Download spectra cache ({SPECTRA_CACHE_SIZE})", key=key, use_container_width=True):
+    if cache_installed:
+        st.success("ARIADNE spectra cache is installed.")
+    elif partial_cache.exists():
+        st.caption(f"Partial download found: {_format_download_size(partial_cache.stat().st_size)}. The download will resume from this file.")
+    if st.button(
+        f"Download optional spectra cache ({SPECTRA_CACHE_SIZE})",
+        key=key,
+        use_container_width=True,
+        disabled=cache_installed,
+    ):
+        if spectra_cache_path().exists():
+            _configure_spectra_cache()
+            st.success("ARIADNE spectra cache is already installed.")
+            return
         with st.spinner(f"Downloading ARIADNE spectra cache ({SPECTRA_CACHE_SIZE}) from Zenodo..."):
             downloaded = fetch_spectra_cache()
-            _configure_spectra_cache()
         st.success(f"Spectra cache installed: {downloaded}")
 
 
@@ -847,14 +924,11 @@ def _format_with_unit(value, unit: str, fmt: str) -> str:
     return f"{number} {unit}" if unit else number
 
 
-def best_fit_dataframe(out: dict) -> pd.DataFrame:
-    candidates = [
-        out.get("best_fit_averaged"),
-        out.get("best_fit"),
-        out.get("best_fit_samples"),
-    ]
-    best = next((item for item in candidates if isinstance(item, dict)), {})
-    uncertainty = out.get("uncertainties_averaged") or out.get("uncertainties") or {}
+def _parameters_dataframe(best: dict | None, uncertainty: dict | None) -> pd.DataFrame:
+    if not isinstance(best, dict):
+        return pd.DataFrame()
+
+    uncertainty = uncertainty or {}
     rows = []
     for key, value in best.items():
         if key == "loglike":
@@ -872,15 +946,35 @@ def best_fit_dataframe(out: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def bma_fit_dataframe(out: dict) -> pd.DataFrame:
+    return _parameters_dataframe(out.get("best_fit_averaged"), out.get("uncertainties_averaged"))
+
+
+def simple_fit_dataframe(out: dict) -> pd.DataFrame:
+    candidates = [
+        (out.get("best_fit"), out.get("uncertainties")),
+        (out.get("best_fit_samples"), out.get("uncertainties_samples")),
+        (out.get("best_fit_averaged"), out.get("uncertainties_averaged")),
+    ]
+    best, uncertainty = next(((best, uncertainty) for best, uncertainty in candidates if isinstance(best, dict)), ({}, {}))
+    return _parameters_dataframe(best, uncertainty)
+
+
 def render_fit_outputs(out: dict, plots_folder: Path, run_bma: bool) -> None:
-    fit_df = best_fit_dataframe(out)
-    if not fit_df.empty:
-        display_df = fit_df.drop(columns=["Ariadne parameter"])
-        radius = fit_df[fit_df["Ariadne parameter"].isin(["rad", "radius"])].drop(columns=["Ariadne parameter"])
+    if run_bma:
+        bma_df = bma_fit_dataframe(out)
+        if not bma_df.empty:
+            st.subheader("Bayesian Model Averaging (BMA) fit parameters")
+            st.dataframe(bma_df.drop(columns=["Ariadne parameter"]), hide_index=True, use_container_width=True)
+
+    simple_df = simple_fit_dataframe(out)
+    if not simple_df.empty:
+        display_df = simple_df.drop(columns=["Ariadne parameter"])
+        radius = simple_df[simple_df["Ariadne parameter"].isin(["rad", "radius"])].drop(columns=["Ariadne parameter"])
         if not radius.empty:
             st.subheader("Stellar radius")
             st.dataframe(radius, hide_index=True, use_container_width=True)
-        st.subheader("Fit parameters")
+        st.subheader("Simple fit parameters")
         st.dataframe(display_df, hide_index=True, use_container_width=True)
 
     fitted_sed = plots_folder / "SED.png"
@@ -904,7 +998,6 @@ def render_fit_outputs(out: dict, plots_folder: Path, run_bma: bool) -> None:
             f"The usual reason is that the optional spectra cache ({SPECTRA_CACHE_SIZE}) is not installed. "
             "The cache is only needed for some fitted SED model plots."
         )
-        render_spectra_cache_button("download_spectra_cache_results")
 
     hr_diagram = plots_folder / "HR_diagram.png"
     if hr_diagram.exists():
@@ -934,6 +1027,7 @@ st.caption(
     f"Version {APP_VERSION}. Resolve a star, fetch Gaia/2MASS/WISE photometry with ARIADNE, "
     "inspect the SED, then launch a dynesty fit."
 )
+render_spectra_cache_button("download_spectra_cache_top")
 
 with st.sidebar:
     st.header("Fit setup")
@@ -1022,8 +1116,6 @@ with st.sidebar:
         with st.spinner("Downloading SFD dustmap data..."):
             fetch_sfd_dustmap()
         st.success("SFD dustmap data is installed for this app.")
-
-    render_spectra_cache_button("download_spectra_cache_sidebar")
 
 
 star_name = st.text_input("Star name", value="WASP-19", placeholder="e.g. WASP-19, HD 209458, TIC 267263253")
