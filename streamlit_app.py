@@ -32,7 +32,7 @@ ROOT = Path(__file__).resolve().parent
 RUNS_DIR = ROOT / "work" / "streamlit-runs"
 DUSTMAP_DIR = ROOT / "work" / "dustmaps"
 PC_TO_LY = 3.261563777
-APP_VERSION = "0.1.2-dev"
+APP_VERSION = "0.1.3-dev"
 SOLAR_RADIUS = "R\u2299"
 SOLAR_MASS = "M\u2299"
 SOLAR_LUMINOSITY = "L\u2299"
@@ -126,6 +126,18 @@ def _patch_isochrones_cache_creation() -> None:
             safe_read_table._ariadne_app_safe = True
             pd.read_table = safe_read_table
 
+        if not getattr(pd.DataFrame.to_hdf, "_ariadne_app_safe", False):
+            original_to_hdf = pd.DataFrame.to_hdf
+
+            def safe_to_hdf(self, path_or_buf, *args, **kwargs):
+                if args:
+                    kwargs.setdefault("key", args[0])
+                    args = args[1:]
+                return original_to_hdf(self, path_or_buf, *args, **kwargs)
+
+            safe_to_hdf._ariadne_app_safe = True
+            pd.DataFrame.to_hdf = safe_to_hdf
+
         if getattr(Grid.download_tarball, "_ariadne_app_safe", False):
             return
 
@@ -139,6 +151,32 @@ def _patch_isochrones_cache_creation() -> None:
 
         safe_download_tarball._ariadne_app_safe = True
         Grid.download_tarball = safe_download_tarball
+
+        import astroARIADNE.fitter as ariadne_fitter
+        import astroARIADNE.isochrone as ariadne_isochrone
+
+        if not getattr(ariadne_fitter.estimate, "_ariadne_app_safe", False):
+            original_estimate = ariadne_fitter.estimate
+
+            def safe_estimate(*args, **kwargs):
+                isochrone_nlive = getattr(ariadne_fitter, "_ariadne_app_isochrone_nlive", None)
+                if not isochrone_nlive:
+                    return original_estimate(*args, **kwargs)
+
+                original_nested_sampler = ariadne_isochrone.dynesty.NestedSampler
+
+                def nested_sampler_with_app_nlive(*sampler_args, **sampler_kwargs):
+                    sampler_kwargs["nlive"] = int(isochrone_nlive)
+                    return original_nested_sampler(*sampler_args, **sampler_kwargs)
+
+                ariadne_isochrone.dynesty.NestedSampler = nested_sampler_with_app_nlive
+                try:
+                    return original_estimate(*args, **kwargs)
+                finally:
+                    ariadne_isochrone.dynesty.NestedSampler = original_nested_sampler
+
+            safe_estimate._ariadne_app_safe = True
+            ariadne_fitter.estimate = safe_estimate
 
 
 def _import_ariadne():
@@ -632,6 +670,9 @@ def run_fit(star, resolved: dict, settings: dict, progress_callback=None) -> tup
     f.out_folder = str(out_folder)
     f.bma = settings["bma"]
     f.n_samples = settings["n_samples"]
+    f.estimate_age = settings["estimate_age"]
+    f.isochrone_dlogz = settings["isochrone_dlogz"]
+    f.isochrone_nlive = settings["isochrone_nlive"]
     f.prior_setup = {
         "teff": "default",
         "logg": "default",
@@ -645,6 +686,9 @@ def run_fit(star, resolved: dict, settings: dict, progress_callback=None) -> tup
 
     if settings["bma"]:
         _patch_isochrones_cache_creation()
+        import astroARIADNE.fitter as ariadne_fitter
+
+        ariadne_fitter._ariadne_app_isochrone_nlive = settings["isochrone_nlive"]
         f.models = settings["models"]
         f.n_grid_jobs = settings["n_grid_jobs"]
         in_file = out_folder / "BMA.pkl"
@@ -653,8 +697,16 @@ def run_fit(star, resolved: dict, settings: dict, progress_callback=None) -> tup
         else:
             if progress_callback:
                 progress_callback(
-                    "Running BMA grid fits with dynesty. ARIADNE writes detailed sampler iteration output to the terminal; the app will update when this phase finishes."
+                    "Running Bayesian Model Averaging (BMA) grid fits with dynesty. ARIADNE writes detailed sampler iteration output to the terminal; the app will update when this phase finishes."
                 )
+                if settings["estimate_age"]:
+                    progress_callback(
+                        f"MIST age/mass and HR-diagram stage is enabled with {settings['isochrone_nlive']} live points and evidence tolerance {settings['isochrone_dlogz']}. This is usually the slowest part."
+                    )
+                else:
+                    progress_callback(
+                        "MIST age/mass and HR-diagram stage is disabled for this quicker exploratory run."
+                    )
             f.initialize()
             f.fit_bma()
     else:
@@ -800,11 +852,11 @@ def render_fit_outputs(out: dict, plots_folder: Path, run_bma: bool) -> None:
             use_container_width=True,
         )
     else:
-        st.info("No HR diagram was produced for this result. ARIADNE only makes that plot when the fit output includes the age/isochrone samples, which is most likely with BMA/isochrone-enabled output.")
+        st.info("No HR diagram was produced for this result. ARIADNE only makes that plot when the fit output includes the age/isochrone samples, which is most likely with Bayesian Model Averaging (BMA) and the MIST age/mass stage enabled.")
 
     bma_histograms = sorted((plots_folder / "histograms").glob("*.png"))
     if bma_histograms:
-        with st.expander("BMA posterior and model-weight plots", expanded=run_bma):
+        with st.expander("Bayesian Model Averaging (BMA) posterior and model-weight plots", expanded=run_bma):
             for image_path in bma_histograms:
                 st.image(str(image_path), caption=image_path.stem.replace("_", " "), use_container_width=True)
 
@@ -822,17 +874,81 @@ st.caption(
 
 with st.sidebar:
     st.header("Fit setup")
+    fit_preset = st.selectbox(
+        "Convergence preset",
+        [
+            "Quick exploratory",
+            "Balanced",
+            "Detailed",
+        ],
+        help=(
+            "Quick uses fewer live points and looser evidence tolerances for a faster first look. "
+            "Balanced and Detailed spend more time on convergence, especially in the MIST isochrone stage."
+        ),
+    )
+    preset_defaults = {
+        "Quick exploratory": {
+            "nlive": 75,
+            "dlogz": 2.0,
+            "n_samples": 5000,
+            "estimate_age": False,
+            "isochrone_dlogz": 2.0,
+            "isochrone_nlive": 150,
+        },
+        "Balanced": {
+            "nlive": 150,
+            "dlogz": 0.5,
+            "n_samples": 25000,
+            "estimate_age": True,
+            "isochrone_dlogz": 1.0,
+            "isochrone_nlive": 250,
+        },
+        "Detailed": {
+            "nlive": 500,
+            "dlogz": 0.1,
+            "n_samples": 50000,
+            "estimate_age": True,
+            "isochrone_dlogz": 0.1,
+            "isochrone_nlive": 500,
+        },
+    }[fit_preset]
     grid = st.selectbox("Single-grid model", ["phoenix", "bosz", "btsettl", "btnextgen", "btcond", "kurucz", "ck04", "sphinx", "tlusty"])
     models = st.multiselect(
-        "BMA models",
+        "Bayesian Model Averaging (BMA) models",
         ["phoenix", "btsettl", "btnextgen", "btcond", "kurucz", "ck04", "bosz"],
         default=["phoenix", "btsettl", "kurucz", "ck04", "bosz"],
     )
-    nlive = st.number_input("Live points", min_value=25, max_value=2000, value=150, step=25)
-    dlogz = st.number_input("Evidence tolerance", min_value=0.01, max_value=5.0, value=0.5, step=0.05)
+    nlive = st.number_input("Live points", min_value=25, max_value=2000, value=preset_defaults["nlive"], step=25)
+    dlogz = st.number_input("Evidence tolerance", min_value=0.01, max_value=5.0, value=preset_defaults["dlogz"], step=0.05)
     threads = st.number_input("Threads", min_value=1, max_value=16, value=2, step=1)
-    n_grid_jobs = st.number_input("BMA grid jobs", min_value=1, max_value=8, value=1, step=1)
-    n_samples = st.number_input("Posterior samples saved", min_value=1000, max_value=200000, value=25000, step=1000)
+    n_grid_jobs = st.number_input("Bayesian Model Averaging (BMA) grid jobs", min_value=1, max_value=8, value=1, step=1)
+    n_samples = st.number_input("Posterior samples saved", min_value=1000, max_value=200000, value=preset_defaults["n_samples"], step=1000)
+    estimate_age = st.checkbox(
+        "Run MIST age/mass and HR-diagram stage",
+        value=preset_defaults["estimate_age"],
+        help=(
+            "This is required for ARIADNE's HR/isochrone plot, but it is usually the slowest part of Bayesian Model Averaging (BMA). "
+            "Turn it off for a much faster exploratory Bayesian Model Averaging (BMA) fit."
+        ),
+    )
+    isochrone_dlogz = st.number_input(
+        "MIST isochrone evidence tolerance",
+        min_value=0.01,
+        max_value=5.0,
+        value=preset_defaults["isochrone_dlogz"],
+        step=0.05,
+        help="Higher values stop the MIST age/mass nested sampler earlier; lower values are more precise but slower.",
+        disabled=not estimate_age,
+    )
+    isochrone_nlive = st.number_input(
+        "MIST isochrone live points",
+        min_value=50,
+        max_value=2000,
+        value=preset_defaults["isochrone_nlive"],
+        step=25,
+        help="Fewer live points make the HR/age stage faster but rougher.",
+        disabled=not estimate_age,
+    )
     av_law = st.selectbox("Extinction law", ["fitzpatrick", "cardelli", "odonnell", "calzetti"])
     bound = st.selectbox("Bound", ["multi", "single", "balls", "cubes"], index=0)
     sample = st.selectbox("Sampler", ["rwalk", "unif", "rslice"], index=0)
@@ -870,9 +986,9 @@ with fit_col:
     fit_clicked = st.button("Run single-grid fit", use_container_width=True)
 with bma_col:
     bma_fit_clicked = st.button(
-        "Run BMA fit",
+        "Run Bayesian Model Averaging (BMA) fit",
         use_container_width=True,
-        help="Runs Bayesian Model Averaging across the selected BMA models. This is slower, but can provide the additional ARIADNE BMA/isochrone plots when the fit output includes the required samples.",
+        help="Runs Bayesian Model Averaging (BMA) across the selected model grids. This is slower, but can provide additional posterior/model-weight plots, and HR/isochrone plots when the MIST stage is enabled.",
     )
 
 replace_output = st.checkbox(
@@ -1006,7 +1122,7 @@ if resolved and star:
             height=0,
         )
         if run_bma and not models:
-            st.error("Choose at least one BMA model.")
+            st.error("Choose at least one Bayesian Model Averaging (BMA) model.")
         else:
             settings = {
                 "bma": run_bma,
@@ -1017,6 +1133,9 @@ if resolved and star:
                 "threads": int(threads),
                 "n_grid_jobs": int(n_grid_jobs),
                 "n_samples": int(n_samples),
+                "estimate_age": bool(estimate_age) if run_bma else False,
+                "isochrone_dlogz": float(isochrone_dlogz),
+                "isochrone_nlive": int(isochrone_nlive),
                 "av_law": av_law,
                 "bound": bound,
                 "sample": sample,
@@ -1024,7 +1143,7 @@ if resolved and star:
                 "replace_output": bool(replace_output),
             }
             try:
-                fit_label = "BMA" if run_bma else f"{grid} single-grid"
+                fit_label = "Bayesian Model Averaging (BMA)" if run_bma else f"{grid} single-grid"
                 with st.status(f"Running ARIADNE {fit_label} fit...", expanded=True) as status:
                     status.write(
                         f"Settings: live points {settings['nlive']}, evidence tolerance {settings['dlogz']}, "
@@ -1032,8 +1151,12 @@ if resolved and star:
                     )
                     if run_bma:
                         status.write(
-                            "BMA is deliberately slower: ARIADNE fits each selected model grid, combines the evidence, then estimates age/mass with MIST isochrones."
+                            "Bayesian Model Averaging (BMA) is deliberately slower: ARIADNE fits each selected model grid, combines the evidence, then optionally estimates age/mass with MIST isochrones."
                         )
+                        if settings["estimate_age"]:
+                            status.write(
+                                f"MIST stage settings: {settings['isochrone_nlive']} live points, evidence tolerance {settings['isochrone_dlogz']}."
+                            )
 
                     def report_progress(message: str) -> None:
                         status.write(message)
