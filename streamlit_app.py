@@ -16,6 +16,7 @@ import pandas as pd
 import plotly.express as px
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from astropy.coordinates import SkyCoord
 from astropy.io.votable import parse_single_table
 from astroquery.ipac.irsa import Irsa
@@ -31,7 +32,7 @@ ROOT = Path(__file__).resolve().parent
 RUNS_DIR = ROOT / "work" / "streamlit-runs"
 DUSTMAP_DIR = ROOT / "work" / "dustmaps"
 PC_TO_LY = 3.261563777
-APP_VERSION = "0.1.1-dev"
+APP_VERSION = "0.1.2-dev"
 SOLAR_RADIUS = "R\u2299"
 SOLAR_MASS = "M\u2299"
 SOLAR_LUMINOSITY = "L\u2299"
@@ -109,6 +110,37 @@ def _configure_spectra_cache() -> Path | None:
     return cache_path
 
 
+def _patch_isochrones_cache_creation() -> None:
+    with contextlib.suppress(Exception):
+        import os
+        from isochrones.grid import Grid, download_file, getLogger
+
+        if not getattr(pd.read_table, "_ariadne_app_safe", False):
+            original_read_table = pd.read_table
+
+            def safe_read_table(*args, **kwargs):
+                if kwargs.pop("delim_whitespace", False):
+                    kwargs.setdefault("sep", r"\s+")
+                return original_read_table(*args, **kwargs)
+
+            safe_read_table._ariadne_app_safe = True
+            pd.read_table = safe_read_table
+
+        if getattr(Grid.download_tarball, "_ariadne_app_safe", False):
+            return
+
+        def safe_download_tarball(self, **kwargs):
+            os.makedirs(self.datadir, exist_ok=True)
+            tarball = self.get_tarball_file(**kwargs)
+            if not os.path.exists(tarball):
+                url = self.get_tarball_url(**kwargs)
+                getLogger().info("Downloading {}...".format(url))
+                download_file(url, tarball)
+
+        safe_download_tarball._ariadne_app_safe = True
+        Grid.download_tarball = safe_download_tarball
+
+
 def _import_ariadne():
     resources_common.sys = sys
 
@@ -117,6 +149,7 @@ def _import_ariadne():
     from astroARIADNE.star import Star
 
     _configure_spectra_cache()
+    _patch_isochrones_cache_creation()
     return Star, Fitter, SEDPlotter
 
 
@@ -573,11 +606,13 @@ def fit_output_file(out_folder: Path, bma: bool, grid: str) -> Path:
     return out_folder / ("BMA.pkl" if bma else f"{grid}_out.pkl")
 
 
-def run_fit(star, resolved: dict, settings: dict) -> tuple[dict, Path, Path, bool]:
+def run_fit(star, resolved: dict, settings: dict, progress_callback=None) -> tuple[dict, Path, Path, bool]:
     _, Fitter, SEDPlotter = _import_ariadne()
 
     run_name = _clean_star_name(resolved["main_id"])
     out_folder = RUNS_DIR / run_name
+    if progress_callback:
+        progress_callback(f"Preparing output folder `{out_folder}`.")
     if settings["replace_output"] and out_folder.exists():
         shutil.rmtree(out_folder)
     out_folder.mkdir(parents=True, exist_ok=True)
@@ -609,12 +644,17 @@ def run_fit(star, resolved: dict, settings: dict) -> tuple[dict, Path, Path, boo
     reused_existing = False
 
     if settings["bma"]:
+        _patch_isochrones_cache_creation()
         f.models = settings["models"]
         f.n_grid_jobs = settings["n_grid_jobs"]
         in_file = out_folder / "BMA.pkl"
         if in_file.exists():
             reused_existing = True
         else:
+            if progress_callback:
+                progress_callback(
+                    "Running BMA grid fits with dynesty. ARIADNE writes detailed sampler iteration output to the terminal; the app will update when this phase finishes."
+                )
             f.initialize()
             f.fit_bma()
     else:
@@ -623,10 +663,14 @@ def run_fit(star, resolved: dict, settings: dict) -> tuple[dict, Path, Path, boo
         if in_file.exists():
             reused_existing = True
         else:
+            if progress_callback:
+                progress_callback("Running single-grid dynesty sampler.")
             f.initialize()
             f.fit_dynesty(out_file=str(in_file))
 
     plots_folder = out_folder / "plots"
+    if progress_callback:
+        progress_callback("Generating ARIADNE plots and loading fit output.")
     plots_folder.mkdir(exist_ok=True)
     _configure_spectra_cache()
     with contextlib.suppress(Exception):
@@ -716,6 +760,58 @@ def best_fit_dataframe(out: dict) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(rows)
+
+
+def render_fit_outputs(out: dict, plots_folder: Path, run_bma: bool) -> None:
+    fit_df = best_fit_dataframe(out)
+    if not fit_df.empty:
+        display_df = fit_df.drop(columns=["Ariadne parameter"])
+        radius = fit_df[fit_df["Ariadne parameter"].isin(["rad", "radius"])].drop(columns=["Ariadne parameter"])
+        if not radius.empty:
+            st.subheader("Stellar radius")
+            st.dataframe(radius, hide_index=True, use_container_width=True)
+        st.subheader("Fit parameters")
+        st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+    fitted_sed = plots_folder / "SED.png"
+    raw_sed = plots_folder / "SED_no_model.png"
+    if fitted_sed.exists():
+        st.subheader("Fitted SED model")
+        st.image(
+            str(fitted_sed),
+            caption="ARIADNE fitted SED model, observed fluxes, synthetic model fluxes, and residuals.",
+            use_container_width=True,
+        )
+    elif raw_sed.exists():
+        st.subheader("Photometry SED")
+        st.image(
+            str(raw_sed),
+            caption="Photometry-only SED. Download the ARIADNE spectra cache to enable the continuous fitted model curve.",
+            use_container_width=True,
+        )
+        st.info("The fit completed, but ARIADNE did not create the continuous SED model plot. The usual reason is that the optional spectra cache is not installed.")
+
+    hr_diagram = plots_folder / "HR_diagram.png"
+    if hr_diagram.exists():
+        st.subheader("HR diagram")
+        st.image(
+            str(hr_diagram),
+            caption="ARIADNE HR diagram / isochrone plot.",
+            use_container_width=True,
+        )
+    else:
+        st.info("No HR diagram was produced for this result. ARIADNE only makes that plot when the fit output includes the age/isochrone samples, which is most likely with BMA/isochrone-enabled output.")
+
+    bma_histograms = sorted((plots_folder / "histograms").glob("*.png"))
+    if bma_histograms:
+        with st.expander("BMA posterior and model-weight plots", expanded=run_bma):
+            for image_path in bma_histograms:
+                st.image(str(image_path), caption=image_path.stem.replace("_", " "), use_container_width=True)
+
+    corner_plot = plots_folder / "CORNER.png"
+    if corner_plot.exists():
+        st.subheader("Posterior corner plot")
+        st.image(str(corner_plot), caption="ARIADNE posterior corner plot.", use_container_width=True)
 
 
 st.title("ARIADNE Stellar SED Fitter")
@@ -894,19 +990,21 @@ if resolved and star:
 
     st.write(f"Coordinates: RA {resolved['ra_deg']:.7f} deg, Dec {resolved['dec_deg']:.7f} deg")
 
-    df = photometry_dataframe(star)
-    chart = plot_sed(df)
-    if chart:
-        st.plotly_chart(chart, use_container_width=True)
-        st.caption(
-            "Vertical bars show flux uncertainty. Horizontal bars show the approximate filter half-width in wavelength, "
-            "so they represent the passband used for the flux measurement rather than uncertainty in wavelength."
-        )
-    st.dataframe(df, use_container_width=True, hide_index=True)
-
     run_requested = fit_clicked or bma_fit_clicked
     if run_requested:
         run_bma = bool(bma_fit_clicked)
+        st.markdown('<div id="fit-progress-anchor"></div>', unsafe_allow_html=True)
+        components.html(
+            """
+            <script>
+            const target = window.parent.document.getElementById("fit-progress-anchor");
+            if (target) {
+              target.scrollIntoView({behavior: "smooth", block: "start"});
+            }
+            </script>
+            """,
+            height=0,
+        )
         if run_bma and not models:
             st.error("Choose at least one BMA model.")
         else:
@@ -927,62 +1025,40 @@ if resolved and star:
             }
             try:
                 fit_label = "BMA" if run_bma else f"{grid} single-grid"
-                with st.spinner(f"Running ARIADNE {fit_label} fit. This can take a while, especially for BMA..."):
-                    out, out_folder, plots_folder, reused_existing = run_fit(star, resolved, settings)
+                with st.status(f"Running ARIADNE {fit_label} fit...", expanded=True) as status:
+                    status.write(
+                        f"Settings: live points {settings['nlive']}, evidence tolerance {settings['dlogz']}, "
+                        f"threads {settings['threads']}."
+                    )
+                    if run_bma:
+                        status.write(
+                            "BMA is deliberately slower: ARIADNE fits each selected model grid, combines the evidence, then estimates age/mass with MIST isochrones."
+                        )
+
+                    def report_progress(message: str) -> None:
+                        status.write(message)
+
+                    out, out_folder, plots_folder, reused_existing = run_fit(
+                        star, resolved, settings, progress_callback=report_progress
+                    )
+                    status.update(label=f"ARIADNE {fit_label} fit finished.", state="complete", expanded=False)
                 if reused_existing:
                     st.info(f"Loaded existing {fit_label} fit result from {out_folder}.")
                 else:
                     st.success(f"{fit_label} fit complete. Output folder: {out_folder}")
-                fit_df = best_fit_dataframe(out)
-                if not fit_df.empty:
-                    display_df = fit_df.drop(columns=["Ariadne parameter"])
-                    radius = fit_df[fit_df["Ariadne parameter"].isin(["rad", "radius"])].drop(columns=["Ariadne parameter"])
-                    if not radius.empty:
-                        st.subheader("Stellar radius")
-                        st.dataframe(radius, hide_index=True, use_container_width=True)
-                    st.subheader("Fit parameters")
-                    st.dataframe(display_df, hide_index=True, use_container_width=True)
-                fitted_sed = plots_folder / "SED.png"
-                raw_sed = plots_folder / "SED_no_model.png"
-                if fitted_sed.exists():
-                    st.subheader("Fitted SED model")
-                    st.image(
-                        str(fitted_sed),
-                        caption="ARIADNE fitted SED model, observed fluxes, synthetic model fluxes, and residuals.",
-                        use_container_width=True,
-                    )
-                elif raw_sed.exists():
-                    st.subheader("Photometry SED")
-                    st.image(
-                        str(raw_sed),
-                        caption="Photometry-only SED. Download the ARIADNE spectra cache to enable the continuous fitted model curve.",
-                        use_container_width=True,
-                    )
-                    st.info("The fit completed, but ARIADNE did not create the continuous SED model plot. The usual reason is that the optional spectra cache is not installed.")
-
-                hr_diagram = plots_folder / "HR_diagram.png"
-                if hr_diagram.exists():
-                    st.subheader("HR diagram")
-                    st.image(
-                        str(hr_diagram),
-                        caption="ARIADNE HR diagram / isochrone plot.",
-                        use_container_width=True,
-                    )
-                else:
-                    st.info("No HR diagram was produced for this result. ARIADNE only makes that plot when the fit output includes the age/isochrone samples, which is most likely with BMA/isochrone-enabled output.")
-
-                bma_histograms = sorted((plots_folder / "histograms").glob("*.png"))
-                if bma_histograms:
-                    with st.expander("BMA posterior and model-weight plots", expanded=run_bma):
-                        for image_path in bma_histograms:
-                            st.image(str(image_path), caption=image_path.stem.replace("_", " "), use_container_width=True)
-
-                corner_plot = plots_folder / "CORNER.png"
-                if corner_plot.exists():
-                    st.subheader("Posterior corner plot")
-                    st.image(str(corner_plot), caption="ARIADNE posterior corner plot.", use_container_width=True)
+                render_fit_outputs(out, plots_folder, run_bma)
             except Exception as exc:
                 st.error("The fit did not complete.")
                 st.exception(exc)
+
+    df = photometry_dataframe(star)
+    chart = plot_sed(df)
+    if chart:
+        st.plotly_chart(chart, use_container_width=True)
+        st.caption(
+            "Vertical bars show flux uncertainty. Horizontal bars show the approximate filter half-width in wavelength, "
+            "so they represent the passband used for the flux measurement rather than uncertainty in wavelength."
+        )
+    st.dataframe(df, use_container_width=True, hide_index=True)
 elif fit_clicked or bma_fit_clicked:
     st.warning("Resolve and fetch photometry before running a fit.")

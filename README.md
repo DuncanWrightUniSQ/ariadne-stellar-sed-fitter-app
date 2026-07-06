@@ -12,7 +12,9 @@ distance in parsecs/light years are shown after retrieval.
 
 The `main` branch continues app development after the verified `v0.1.0` release.
 It includes separate buttons for a faster single-grid fit and a heavier BMA fit,
-with larger plot axis labels/tick labels for readability.
+with larger plot axis labels/tick labels for readability. Fit runs show a
+near-button status panel and scroll the page to it so long BMA jobs are visibly
+in progress.
 
 ## Run Locally
 
@@ -38,5 +40,7 @@ http://127.0.0.1:8501
 - Use **Run BMA fit** to run Bayesian Model Averaging across the selected BMA
   models. This is slower, but can produce additional BMA posterior/model-weight
   plots and HR/isochrone plots when ARIADNE has the required samples.
+- Existing MIST isochrone cache directories are reused safely during BMA age/mass
+  estimation.
 - The HR diagram is shown when ARIADNE produces the required age/isochrone
   samples for the selected fit output.
