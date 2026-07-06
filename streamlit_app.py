@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent
 RUNS_DIR = ROOT / "work" / "streamlit-runs"
 DUSTMAP_DIR = ROOT / "work" / "dustmaps"
 PC_TO_LY = 3.261563777
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1-dev"
 SOLAR_RADIUS = "R\u2299"
 SOLAR_MASS = "M\u2299"
 SOLAR_LUMINOSITY = "L\u2299"
@@ -505,22 +505,22 @@ def plot_sed(df: pd.DataFrame):
     fig.update_xaxes(
         type="log",
         showgrid=True,
-        title_font={"size": 16},
-        tickfont={"size": 13},
+        title_font={"size": 22},
+        tickfont={"size": 17},
         ticks="outside",
     )
     fig.update_yaxes(
         type="log",
         showgrid=True,
-        title_font={"size": 16},
-        tickfont={"size": 13},
+        title_font={"size": 22},
+        tickfont={"size": 17},
         ticks="outside",
     )
     fig.update_layout(
-        height=500,
-        margin={"l": 70, "r": 30, "t": 30, "b": 70},
+        height=540,
+        margin={"l": 92, "r": 34, "t": 34, "b": 86},
         legend_title_text="",
-        font={"size": 13},
+        font={"size": 16},
     )
     return fig
 
@@ -587,11 +587,25 @@ def run_fit(star, resolved: dict, settings: dict) -> tuple[dict, Path, Path, boo
     _configure_spectra_cache()
     with contextlib.suppress(Exception):
         artist = SEDPlotter(str(in_file), str(plots_folder), png=True)
-        artist.plot_SED_no_model()
-        artist.plot_SED()
-        artist.plot_bma_HR(25)
-        artist.plot_corner()
-        artist.clean()
+    if "artist" in locals():
+        artist.fontsize = 24
+        artist.tick_labelsize = 18
+        artist.corner_fontsize = 17
+        artist.corner_tick_fontsize = 14
+    if "artist" in locals():
+        with contextlib.suppress(Exception):
+            artist.plot_SED_no_model()
+        with contextlib.suppress(Exception):
+            artist.plot_SED()
+        with contextlib.suppress(Exception):
+            artist.plot_bma_HR(25)
+        if settings["bma"]:
+            with contextlib.suppress(Exception):
+                artist.plot_bma_hist()
+        with contextlib.suppress(Exception):
+            artist.plot_corner()
+        with contextlib.suppress(Exception):
+            artist.clean()
 
     out = {}
     if in_file.exists():
@@ -668,19 +682,16 @@ st.caption(
 
 with st.sidebar:
     st.header("Fit setup")
-    mode = st.radio("Fit mode", ["Single grid", "BMA"], index=0)
-    bma = mode == "BMA"
-    grid = st.selectbox("Single grid", ["phoenix", "bosz", "btsettl", "btnextgen", "btcond", "kurucz", "ck04", "sphinx", "tlusty"], disabled=bma)
+    grid = st.selectbox("Single-grid model", ["phoenix", "bosz", "btsettl", "btnextgen", "btcond", "kurucz", "ck04", "sphinx", "tlusty"])
     models = st.multiselect(
         "BMA models",
         ["phoenix", "btsettl", "btnextgen", "btcond", "kurucz", "ck04", "bosz"],
         default=["phoenix", "btsettl", "kurucz", "ck04", "bosz"],
-        disabled=not bma,
     )
     nlive = st.number_input("Live points", min_value=25, max_value=2000, value=150, step=25)
     dlogz = st.number_input("Evidence tolerance", min_value=0.01, max_value=5.0, value=0.5, step=0.05)
     threads = st.number_input("Threads", min_value=1, max_value=16, value=2, step=1)
-    n_grid_jobs = st.number_input("BMA grid jobs", min_value=1, max_value=8, value=1, step=1, disabled=not bma)
+    n_grid_jobs = st.number_input("BMA grid jobs", min_value=1, max_value=8, value=1, step=1)
     n_samples = st.number_input("Posterior samples saved", min_value=1000, max_value=200000, value=25000, step=1000)
     av_law = st.selectbox("Extinction law", ["fitzpatrick", "cardelli", "odonnell", "calzetti"])
     bound = st.selectbox("Bound", ["multi", "single", "balls", "cubes"], index=0)
@@ -712,11 +723,17 @@ if "resolved" not in st.session_state:
 if "star" not in st.session_state:
     st.session_state.star = None
 
-resolve_col, fit_col = st.columns([1, 1])
+resolve_col, fit_col, bma_col = st.columns([1.1, 1, 1])
 with resolve_col:
     resolve_clicked = st.button("Resolve and fetch photometry", type="primary", use_container_width=True)
 with fit_col:
-    fit_clicked = st.button("Run ARIADNE fit", use_container_width=True)
+    fit_clicked = st.button("Run single-grid fit", use_container_width=True)
+with bma_col:
+    bma_fit_clicked = st.button(
+        "Run BMA fit",
+        use_container_width=True,
+        help="Runs Bayesian Model Averaging across the selected BMA models. This is slower, but can provide the additional ARIADNE BMA/isochrone plots when the fit output includes the required samples.",
+    )
 
 replace_output = st.checkbox(
     "Rerun fit even if an existing result file is present",
@@ -843,12 +860,14 @@ if resolved and star:
         )
     st.dataframe(df, use_container_width=True, hide_index=True)
 
-    if fit_clicked:
-        if bma and not models:
+    run_requested = fit_clicked or bma_fit_clicked
+    if run_requested:
+        run_bma = bool(bma_fit_clicked)
+        if run_bma and not models:
             st.error("Choose at least one BMA model.")
         else:
             settings = {
-                "bma": bma,
+                "bma": run_bma,
                 "grid": grid,
                 "models": models,
                 "nlive": int(nlive),
@@ -863,12 +882,13 @@ if resolved and star:
                 "replace_output": bool(replace_output),
             }
             try:
-                with st.spinner("Running ARIADNE. This can take a while, especially for BMA..."):
+                fit_label = "BMA" if run_bma else f"{grid} single-grid"
+                with st.spinner(f"Running ARIADNE {fit_label} fit. This can take a while, especially for BMA..."):
                     out, out_folder, plots_folder, reused_existing = run_fit(star, resolved, settings)
                 if reused_existing:
-                    st.info(f"Loaded existing fit result from {out_folder}.")
+                    st.info(f"Loaded existing {fit_label} fit result from {out_folder}.")
                 else:
-                    st.success(f"Fit complete. Output folder: {out_folder}")
+                    st.success(f"{fit_label} fit complete. Output folder: {out_folder}")
                 fit_df = best_fit_dataframe(out)
                 if not fit_df.empty:
                     display_df = fit_df.drop(columns=["Ariadne parameter"])
@@ -907,6 +927,12 @@ if resolved and star:
                 else:
                     st.info("No HR diagram was produced for this result. ARIADNE only makes that plot when the fit output includes the age/isochrone samples, which is most likely with BMA/isochrone-enabled output.")
 
+                bma_histograms = sorted((plots_folder / "histograms").glob("*.png"))
+                if bma_histograms:
+                    with st.expander("BMA posterior and model-weight plots", expanded=run_bma):
+                        for image_path in bma_histograms:
+                            st.image(str(image_path), caption=image_path.stem.replace("_", " "), use_container_width=True)
+
                 corner_plot = plots_folder / "CORNER.png"
                 if corner_plot.exists():
                     st.subheader("Posterior corner plot")
@@ -914,5 +940,5 @@ if resolved and star:
             except Exception as exc:
                 st.error("The fit did not complete.")
                 st.exception(exc)
-elif fit_clicked:
+elif fit_clicked or bma_fit_clicked:
     st.warning("Resolve and fetch photometry before running a fit.")
