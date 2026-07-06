@@ -1,6 +1,6 @@
 # ARIADNE Stellar SED Fitter App
 
-Verified version: `0.1.0`
+Verified version: `0.2`
 
 This is the main app development line for a Streamlit interface around
 [jvines/astroariadne](https://github.com/jvines/astroariadne).
@@ -10,7 +10,7 @@ the SED with passband-width bars and flux uncertainties, runs an ARIADNE dynesty
 fit, and reports fitted stellar parameters including radius. Gaia RUWE and Gaia
 distance in parsecs/light years are shown after retrieval.
 
-The `main` branch continues app development after the verified `v0.1.0` release.
+The `main` branch continues app development after the verified `v0.2` release.
 It includes separate buttons for a faster single-grid fit and a heavier Bayesian
 Model Averaging (BMA) fit, with larger plot axis labels/tick labels for
 readability. Fit runs show a near-button status panel and scroll the page to it
