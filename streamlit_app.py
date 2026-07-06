@@ -644,7 +644,7 @@ def fit_output_file(out_folder: Path, bma: bool, grid: str) -> Path:
     return out_folder / ("BMA.pkl" if bma else f"{grid}_out.pkl")
 
 
-def run_fit(star, resolved: dict, settings: dict, progress_callback=None) -> tuple[dict, Path, Path, bool]:
+def run_fit(star, resolved: dict, settings: dict, progress_callback=None) -> tuple[dict, Path, Path, bool, list[str], list[str]]:
     _, Fitter, SEDPlotter = _import_ariadne()
 
     run_name = _clean_star_name(resolved["main_id"])
@@ -683,6 +683,8 @@ def run_fit(star, resolved: dict, settings: dict, progress_callback=None) -> tup
     }
 
     reused_existing = False
+    plot_messages: list[str] = []
+    plot_warnings: list[str] = []
 
     if settings["bma"]:
         _patch_isochrones_cache_creation()
@@ -725,27 +727,51 @@ def run_fit(star, resolved: dict, settings: dict, progress_callback=None) -> tup
         progress_callback("Generating ARIADNE plots and loading fit output.")
     plots_folder.mkdir(exist_ok=True)
     _configure_spectra_cache()
-    with contextlib.suppress(Exception):
-        artist = SEDPlotter(str(in_file), str(plots_folder), png=True)
-    if "artist" in locals():
+    try:
+        artist = SEDPlotter(str(in_file), str(plots_folder))
         artist.fontsize = 24
         artist.tick_labelsize = 18
         artist.corner_fontsize = 17
         artist.corner_tick_fontsize = 14
-    if "artist" in locals():
-        with contextlib.suppress(Exception):
-            artist.plot_SED_no_model()
-        with contextlib.suppress(Exception):
-            artist.plot_SED()
-        with contextlib.suppress(Exception):
-            artist.plot_bma_HR(25)
+
+        plot_jobs = [
+            ("Photometry-only SED", artist.plot_SED_no_model, plots_folder / "SED_no_model.png"),
+            ("Fitted SED model", artist.plot_SED, plots_folder / "SED.png"),
+        ]
         if settings["bma"]:
-            with contextlib.suppress(Exception):
-                artist.plot_bma_hist()
-        with contextlib.suppress(Exception):
-            artist.plot_corner()
-        with contextlib.suppress(Exception):
+            plot_jobs.extend(
+                [
+                    ("HR diagram", lambda: artist.plot_bma_HR(25), plots_folder / "HR_diagram.png"),
+                    (
+                        "Bayesian Model Averaging (BMA) posterior and model-weight plots",
+                        artist.plot_bma_hist,
+                        plots_folder / "histograms",
+                    ),
+                ]
+            )
+        plot_jobs.append(("Posterior corner plot", artist.plot_corner, plots_folder / "CORNER.png"))
+
+        for label, plot_func, expected_path in plot_jobs:
+            try:
+                plot_func()
+                if expected_path.is_dir():
+                    if any(expected_path.glob("*.png")):
+                        plot_messages.append(f"Created {label}.")
+                    else:
+                        plot_warnings.append(f"{label}: ARIADNE did not create any PNG files in {expected_path}.")
+                elif expected_path.exists():
+                    plot_messages.append(f"Created {label}.")
+                else:
+                    plot_warnings.append(f"{label}: ARIADNE did not create {expected_path.name}.")
+            except Exception as exc:
+                plot_warnings.append(f"{label}: {type(exc).__name__}: {exc}")
+
+        try:
             artist.clean()
+        except Exception as exc:
+            plot_warnings.append(f"Plot cleanup: {type(exc).__name__}: {exc}")
+    except Exception as exc:
+        plot_warnings.append(f"Could not initialise ARIADNE plotter: {type(exc).__name__}: {exc}")
 
     out = {}
     if in_file.exists():
@@ -754,7 +780,7 @@ def run_fit(star, resolved: dict, settings: dict, progress_callback=None) -> tup
     elif hasattr(f, "to_dict"):
         with contextlib.suppress(Exception):
             out = f.to_dict()
-    return out, out_folder, plots_folder, reused_existing
+    return out, out_folder, plots_folder, reused_existing, plot_messages, plot_warnings
 
 
 def _parameter_metadata(key: str) -> tuple[str, str, str]:
@@ -1161,7 +1187,7 @@ if resolved and star:
                     def report_progress(message: str) -> None:
                         status.write(message)
 
-                    out, out_folder, plots_folder, reused_existing = run_fit(
+                    out, out_folder, plots_folder, reused_existing, plot_messages, plot_warnings = run_fit(
                         star, resolved, settings, progress_callback=report_progress
                     )
                     status.update(label=f"ARIADNE {fit_label} fit finished.", state="complete", expanded=False)
@@ -1169,6 +1195,12 @@ if resolved and star:
                     st.info(f"Loaded existing {fit_label} fit result from {out_folder}.")
                 else:
                     st.success(f"{fit_label} fit complete. Output folder: {out_folder}")
+                for message in plot_messages:
+                    st.caption(message)
+                if plot_warnings:
+                    with st.expander("Plot generation notes", expanded=True):
+                        for warning in plot_warnings:
+                            st.warning(warning)
                 render_fit_outputs(out, plots_folder, run_bma)
             except Exception as exc:
                 st.error("The fit did not complete.")
