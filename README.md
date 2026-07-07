@@ -36,10 +36,10 @@ http://127.0.0.1:8501
 
 - The SFD dustmap can be downloaded from the app sidebar.
 - The optional ARIADNE spectra cache is about 2.8 GB / 2.6 GiB and can be
-  downloaded from the app sidebar or from the results message when a continuous
-  fitted SED model plot is unavailable. It is only needed for some fitted SED
-  model plots, not for the numerical fit, parameter tables, corner plots, or
-  Bayesian Model Averaging (BMA) histograms.
+  downloaded from the top-of-page cache control when a continuous fitted SED
+  model plot is unavailable. It is only needed for some fitted SED model plots,
+  not for the numerical fit, parameter tables, corner plots, or Bayesian Model
+  Averaging (BMA) histograms.
 - Fit uncertainty values are displayed as lower/upper offsets from the best fit:
   `- / +`.
 - Use **Run single-grid fit** for a faster fit using the selected single model.
@@ -53,3 +53,12 @@ http://127.0.0.1:8501
   Model Averaging (BMA) age/mass estimation.
 - The HR diagram is shown when ARIADNE produces the required age/isochrone
   samples for the selected fit output.
+
+## License and Attribution
+
+This interface is distributed under the MIT License; see `LICENSE`.
+
+ARIADNE / astroARIADNE is authored and maintained by Jose Vines / Jose Ignacio
+Vines and is also distributed under the MIT License. See
+`THIRD_PARTY_NOTICES.md` for upstream attribution, license-notice details, and
+citation guidance.
