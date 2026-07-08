@@ -507,6 +507,30 @@ def gaia_source_from_position(ra_deg: float, dec_deg: float, radius_arcsec: floa
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
+def gaia_observables_from_position(ra_deg: float, dec_deg: float, radius_arcsec: float = 30.0) -> list | None:
+    query = f"""
+        SELECT TOP 1 source_id, ra, dec, parallax, parallax_error,
+               phot_g_mean_mag, phot_g_mean_flux_over_error,
+               phot_bp_mean_mag, phot_bp_mean_flux_over_error,
+               phot_rp_mean_mag, phot_rp_mean_flux_over_error,
+               ruwe,
+               DISTANCE(
+                 POINT('ICRS', ra, dec),
+                 POINT('ICRS', {ra_deg:.12f}, {dec_deg:.12f})
+               ) * 3600 AS sep_arcsec
+        FROM gaiadr3.gaia_source
+        WHERE 1 = CONTAINS(
+          POINT('ICRS', ra, dec),
+          CIRCLE('ICRS', {ra_deg:.12f}, {dec_deg:.12f}, {radius_arcsec / 3600.0:.12f})
+        )
+        AND phot_g_mean_mag IS NOT NULL
+        ORDER BY sep_arcsec ASC
+    """
+    data = run_gaia_tap_json(query, timeout=30)
+    return data[0] if data else None
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
 def query_gaia_ruwe(gaia_dr3_id: int | None) -> float | None:
     if gaia_dr3_id is None:
         return None
@@ -584,10 +608,13 @@ def _download_vizier_observables(
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def download_gaia_observables(gaia_dr3_id: int | None) -> dict:
+def download_gaia_observables(gaia_dr3_id: int | None, ra_deg: float | None = None, dec_deg: float | None = None) -> dict:
     mag_dict = {}
     plx = plx_e = ruwe = None
     gaia_ra = gaia_dec = None
+    source_id = gaia_dr3_id
+    sep_arcsec = None
+    row = None
 
     if gaia_dr3_id is not None:
         query = f"""
@@ -602,16 +629,22 @@ def download_gaia_observables(gaia_dr3_id: int | None) -> dict:
         rows = run_gaia_tap_json(query, timeout=30)
         if rows:
             row = rows[0]
-            gaia_ra, gaia_dec = row[1], row[2]
-            plx, plx_e = row[3], row[4]
-            for band, mag_index, snr_index in [
-                ("GaiaDR2v2_G", 5, 6),
-                ("GaiaDR2v2_BP", 7, 8),
-                ("GaiaDR2v2_RP", 9, 10),
-            ]:
-                if row[mag_index] is not None:
-                    mag_dict[band] = (float(row[mag_index]), _gaia_mag_error(row[snr_index]))
-            ruwe = row[11]
+            row = row + [None]
+    elif ra_deg is not None and dec_deg is not None:
+        row = gaia_observables_from_position(float(ra_deg), float(dec_deg))
+
+    if row is not None:
+        source_id, gaia_ra, gaia_dec = int(row[0]), row[1], row[2]
+        plx, plx_e = row[3], row[4]
+        for band, mag_index, snr_index in [
+            ("GaiaDR2v2_G", 5, 6),
+            ("GaiaDR2v2_BP", 7, 8),
+            ("GaiaDR2v2_RP", 9, 10),
+        ]:
+            if row[mag_index] is not None:
+                mag_dict[band] = (float(row[mag_index]), _gaia_mag_error(row[snr_index]))
+        ruwe = row[11]
+        sep_arcsec = row[12] if len(row) > 12 else None
 
     usable_plx = float(plx) if plx is not None and plx > 0 else None
     usable_plx_e = float(plx_e) if usable_plx is not None and plx_e is not None else None
@@ -622,6 +655,8 @@ def download_gaia_observables(gaia_dr3_id: int | None) -> dict:
 
     return {
         "mag_dict": mag_dict,
+        "source_id": source_id,
+        "sep_arcsec": float(sep_arcsec) if sep_arcsec is not None else None,
         "plx": usable_plx,
         "plx_e": usable_plx_e,
         "dist": dist,
@@ -657,15 +692,20 @@ def download_wise_observables(ra_deg: float, dec_deg: float) -> dict:
     mag_dict = {}
     coord = SkyCoord(ra_deg, dec_deg, unit="deg")
     with contextlib.suppress(Exception):
-        wise = Irsa.query_region(coord, catalog="allwise_p3as_psd", spatial="Cone", radius=5 * u.arcsec)
+        wise = Irsa.query_region(coord, catalog="allwise_p3as_psd", spatial="Cone", radius=20 * u.arcsec)
         if len(wise):
+            if "dist" in wise.colnames:
+                wise.sort("dist")
             row = wise[0]
-            for band, mag_col, err_col in [
-                ("WISE_RSR_W1", "w1mpro", "w1sigmpro"),
-                ("WISE_RSR_W2", "w2mpro", "w2sigmpro"),
-                ("WISE_RSR_W3", "w3mpro", "w3sigmpro"),
-                ("WISE_RSR_W4", "w4mpro", "w4sigmpro"),
+            ph_qual = str(row["ph_qual"] if "ph_qual" in wise.colnames else "")
+            for band_index, band, mag_col, err_col in [
+                (0, "WISE_RSR_W1", "w1mpro", "w1sigmpro"),
+                (1, "WISE_RSR_W2", "w2mpro", "w2sigmpro"),
+                (2, "WISE_RSR_W3", "w3mpro", "w3sigmpro"),
+                (3, "WISE_RSR_W4", "w4mpro", "w4sigmpro"),
             ]:
+                if band_index >= len(ph_qual) or ph_qual[band_index] not in "ABC":
+                    continue
                 mag = _maybe_float(row, mag_col)
                 err = _maybe_float(row, err_col)
                 _add_mag(mag_dict, band, mag, err)
@@ -812,7 +852,7 @@ def download_observables(
     gaia_dr3_id: int | None,
     retrieve_sources: tuple[str, ...],
 ) -> dict:
-    gaia = download_gaia_observables(gaia_dr3_id)
+    gaia = download_gaia_observables(gaia_dr3_id, ra_deg, dec_deg)
     query_ra = gaia["ra_deg"] or ra_deg
     query_dec = gaia["dec_deg"] or dec_deg
     mag_dict = {}
@@ -846,6 +886,8 @@ def download_observables(
     return {
         "mag_dict": mag_dict,
         "source_by_band": source_by_band,
+        "gaia_source_id": gaia["source_id"],
+        "gaia_sep_arcsec": gaia["sep_arcsec"],
         "plx": gaia["plx"],
         "plx_e": gaia["plx_e"],
         "dist": gaia["dist"],
@@ -1531,12 +1573,21 @@ if resolve_clicked:
                 "dist": observables["dist"],
                 "dist_e": observables["dist_e"],
                 "ruwe": observables["ruwe"],
+                "source_id": observables["gaia_source_id"],
+                "sep_arcsec": observables["gaia_sep_arcsec"],
                 "ra_deg": None,
                 "dec_deg": None,
             }
+            if observables["gaia_source_id"] is not None:
+                resolved["gaia_dr3_id"] = observables["gaia_source_id"]
             query_ra = gaia["ra_deg"] or resolved["ra_deg"]
             query_dec = gaia["dec_deg"] or resolved["dec_deg"]
             gaia_bands = [DISPLAY_NAMES[k] for k in ARIADNE_BANDS if k in gaia["mag_dict"]]
+            gaia_match_note = (
+                f" within {gaia['sep_arcsec']:.1f} arcsec"
+                if gaia["sep_arcsec"] is not None
+                else ""
+            )
             st.write(
                 "Gaia returned "
                 + (", ".join(gaia_bands) if gaia_bands else "no requested photometry")
@@ -1545,6 +1596,7 @@ if resolve_clicked:
                     if gaia["dist"] is not None
                     else "; no positive parallax distance."
                 )
+                + gaia_match_note
             )
 
             st.write("Querying selected photometry catalogs around the resolved coordinates.")
