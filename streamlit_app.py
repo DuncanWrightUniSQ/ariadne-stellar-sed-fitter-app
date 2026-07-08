@@ -21,6 +21,7 @@ from astropy.coordinates import SkyCoord
 from astropy.io.votable import parse_single_table
 from astroquery.ipac.irsa import Irsa
 from astroquery.simbad import Simbad
+from astroquery.vizier import Vizier
 from dustmaps.config import config as dustmaps_config
 
 import importlib.resources._common as resources_common
@@ -56,25 +57,103 @@ PARAMETER_DISPLAY = {
 }
 
 ARIADNE_BANDS = [
+    "GALEX_FUV",
+    "GALEX_NUV",
+    "SkyMapper_u",
+    "SDSS_u",
+    "GROUND_JOHNSON_U",
+    "SkyMapper_v",
+    "TYCHO_B_MvB",
+    "GROUND_JOHNSON_B",
+    "SDSS_g",
+    "PS1_g",
+    "SkyMapper_g",
     "GaiaDR2v2_BP",
+    "TYCHO_V_MvB",
+    "GROUND_JOHNSON_V",
+    "SkyMapper_r",
+    "SDSS_r",
+    "PS1_r",
     "GaiaDR2v2_G",
+    "SDSS_i",
+    "PS1_i",
+    "SkyMapper_i",
     "GaiaDR2v2_RP",
+    "PS1_z",
+    "SDSS_z",
+    "SkyMapper_z",
+    "PS1_y",
     "2MASS_J",
     "2MASS_H",
     "2MASS_Ks",
     "WISE_RSR_W1",
     "WISE_RSR_W2",
+    "WISE_RSR_W3",
+    "WISE_RSR_W4",
 ]
 
 DISPLAY_NAMES = {
+    "GALEX_FUV": "GALEX FUV",
+    "GALEX_NUV": "GALEX NUV",
+    "SkyMapper_u": "SkyMapper u",
+    "SkyMapper_v": "SkyMapper v",
+    "SkyMapper_g": "SkyMapper g",
+    "SkyMapper_r": "SkyMapper r",
+    "SkyMapper_i": "SkyMapper i",
+    "SkyMapper_z": "SkyMapper z",
+    "SDSS_u": "SDSS u",
+    "SDSS_g": "SDSS g",
+    "SDSS_r": "SDSS r",
+    "SDSS_i": "SDSS i",
+    "SDSS_z": "SDSS z",
+    "PS1_g": "Pan-STARRS g",
+    "PS1_r": "Pan-STARRS r",
+    "PS1_i": "Pan-STARRS i",
+    "PS1_z": "Pan-STARRS z",
+    "PS1_y": "Pan-STARRS y",
     "GaiaDR2v2_BP": "Gaia BP",
     "GaiaDR2v2_G": "Gaia G",
     "GaiaDR2v2_RP": "Gaia RP",
+    "TYCHO_B_MvB": "Tycho BT",
+    "TYCHO_V_MvB": "Tycho VT",
+    "GROUND_JOHNSON_U": "Johnson U",
+    "GROUND_JOHNSON_B": "Johnson B",
+    "GROUND_JOHNSON_V": "Johnson V",
     "2MASS_J": "2MASS J",
     "2MASS_H": "2MASS H",
     "2MASS_Ks": "2MASS Ks",
     "WISE_RSR_W1": "WISE W1",
     "WISE_RSR_W2": "WISE W2",
+    "WISE_RSR_W3": "WISE W3",
+    "WISE_RSR_W4": "WISE W4",
+}
+
+PHOTOMETRY_SOURCE_BANDS = {
+    "gaia": ["GaiaDR2v2_BP", "GaiaDR2v2_G", "GaiaDR2v2_RP"],
+    "2mass": ["2MASS_J", "2MASS_H", "2MASS_Ks"],
+    "wise12": ["WISE_RSR_W1", "WISE_RSR_W2"],
+    "wise34": ["WISE_RSR_W3", "WISE_RSR_W4"],
+    "panstarrs": ["PS1_g", "PS1_r", "PS1_i", "PS1_z", "PS1_y"],
+    "sdss": ["SDSS_u", "SDSS_g", "SDSS_r", "SDSS_i", "SDSS_z"],
+    "skymapper": ["SkyMapper_u", "SkyMapper_v", "SkyMapper_g", "SkyMapper_r", "SkyMapper_i", "SkyMapper_z"],
+    "apass": ["GROUND_JOHNSON_B", "GROUND_JOHNSON_V", "SDSS_g", "SDSS_r", "SDSS_i"],
+    "tycho": ["TYCHO_B_MvB", "TYCHO_V_MvB"],
+    "galex": ["GALEX_FUV", "GALEX_NUV"],
+    "johnson": ["GROUND_JOHNSON_U", "GROUND_JOHNSON_B", "GROUND_JOHNSON_V"],
+}
+
+PHOTOMETRY_SOURCE_LABELS = {
+    "gaia": "Gaia BP/G/RP",
+    "2mass": "2MASS J/H/Ks",
+    "wise12": "WISE W1/W2",
+    "wise34": "WISE W3/W4",
+    "panstarrs": "Pan-STARRS grizy",
+    "sdss": "SDSS ugriz",
+    "skymapper": "SkyMapper uvgriz",
+    "apass": "APASS BVgri",
+    "tycho": "Tycho-2 BT/VT",
+    "galex": "GALEX FUV/NUV",
+    "johnson": "Johnson UBV",
 }
 
 GAIA_TAP_SERVICES = [
@@ -454,7 +533,54 @@ def _maybe_float(row, name: str):
     value = row[name]
     if value is np.ma.masked:
         return None
+    with contextlib.suppress(Exception):
+        if np.ma.is_masked(value):
+            return None
     return float(value)
+
+
+def _add_mag(mag_dict: dict, band: str, mag, err, default_err: float = 0.03) -> None:
+    if band in mag_dict or mag is None:
+        return
+    with contextlib.suppress(Exception):
+        mag = float(mag)
+        err = float(err) if err is not None and float(err) > 0 else default_err
+        if np.isfinite(mag) and np.isfinite(err):
+            mag_dict[band] = (mag, err)
+
+
+def _nearest_vizier_row(ra_deg: float, dec_deg: float, catalog: str, radius_arcsec: float = 5):
+    coord = SkyCoord(ra_deg, dec_deg, unit="deg")
+    tables = Vizier(columns=["**", "+_r"], row_limit=20).query_region(
+        coord,
+        catalog=catalog,
+        radius=radius_arcsec * u.arcsec,
+    )
+    if not tables:
+        return None
+    table = tables[0]
+    if len(table) == 0:
+        return None
+    if "_r" in table.colnames:
+        table.sort("_r")
+    return table[0]
+
+
+def _download_vizier_observables(
+    ra_deg: float,
+    dec_deg: float,
+    catalog: str,
+    bands: list[tuple[str, str, str]],
+    radius_arcsec: float = 5,
+) -> dict:
+    mag_dict = {}
+    with contextlib.suppress(Exception):
+        row = _nearest_vizier_row(ra_deg, dec_deg, catalog, radius_arcsec=radius_arcsec)
+        if row is None:
+            return mag_dict
+        for band, mag_col, err_col in bands:
+            _add_mag(mag_dict, band, _maybe_float(row, mag_col), _maybe_float(row, err_col))
+    return mag_dict
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -537,26 +663,189 @@ def download_wise_observables(ra_deg: float, dec_deg: float) -> dict:
             for band, mag_col, err_col in [
                 ("WISE_RSR_W1", "w1mpro", "w1sigmpro"),
                 ("WISE_RSR_W2", "w2mpro", "w2sigmpro"),
+                ("WISE_RSR_W3", "w3mpro", "w3sigmpro"),
+                ("WISE_RSR_W4", "w4mpro", "w4sigmpro"),
             ]:
                 mag = _maybe_float(row, mag_col)
                 err = _maybe_float(row, err_col)
-                if mag is not None:
-                    mag_dict[band] = (mag, err if err is not None and err > 0 else 0.03)
+                _add_mag(mag_dict, band, mag, err)
     return mag_dict
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
-def download_observables(ra_deg: float, dec_deg: float, gaia_dr3_id: int | None) -> dict:
+def download_panstarrs_observables(ra_deg: float, dec_deg: float) -> dict:
+    return _download_vizier_observables(
+        ra_deg,
+        dec_deg,
+        "II/349/ps1",
+        [
+            ("PS1_g", "gmag", "e_gmag"),
+            ("PS1_r", "rmag", "e_rmag"),
+            ("PS1_i", "imag", "e_imag"),
+            ("PS1_z", "zmag", "e_zmag"),
+            ("PS1_y", "ymag", "e_ymag"),
+        ],
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_sdss_observables(ra_deg: float, dec_deg: float) -> dict:
+    return _download_vizier_observables(
+        ra_deg,
+        dec_deg,
+        "V/147/sdss12",
+        [
+            ("SDSS_u", "umag", "e_umag"),
+            ("SDSS_g", "gmag", "e_gmag"),
+            ("SDSS_r", "rmag", "e_rmag"),
+            ("SDSS_i", "imag", "e_imag"),
+            ("SDSS_z", "zmag", "e_zmag"),
+        ],
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_apass_observables(ra_deg: float, dec_deg: float) -> dict:
+    return _download_vizier_observables(
+        ra_deg,
+        dec_deg,
+        "II/336/apass9",
+        [
+            ("GROUND_JOHNSON_V", "Vmag", "e_Vmag"),
+            ("GROUND_JOHNSON_B", "Bmag", "e_Bmag"),
+            ("SDSS_g", "g'mag", "e_g'mag"),
+            ("SDSS_r", "r'mag", "e_r'mag"),
+            ("SDSS_i", "i'mag", "e_i'mag"),
+        ],
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_tycho_observables(ra_deg: float, dec_deg: float) -> dict:
+    return _download_vizier_observables(
+        ra_deg,
+        dec_deg,
+        "I/259/tyc2",
+        [
+            ("TYCHO_B_MvB", "BTmag", "e_BTmag"),
+            ("TYCHO_V_MvB", "VTmag", "e_VTmag"),
+        ],
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_galex_observables(ra_deg: float, dec_deg: float) -> dict:
+    return _download_vizier_observables(
+        ra_deg,
+        dec_deg,
+        "II/312/ais",
+        [
+            ("GALEX_FUV", "FUV", "e_FUV"),
+            ("GALEX_NUV", "NUV", "e_NUV"),
+        ],
+    )
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_johnson_observables(ra_deg: float, dec_deg: float) -> dict:
+    mag_dict = {}
+    with contextlib.suppress(Exception):
+        row = _nearest_vizier_row(ra_deg, dec_deg, "II/168/ubvmeans", radius_arcsec=180)
+        if row is None:
+            return mag_dict
+        v = _maybe_float(row, "Vmag")
+        v_e = _maybe_float(row, "e_Vmag")
+        _add_mag(mag_dict, "GROUND_JOHNSON_V", v, v_e)
+        bv = _maybe_float(row, "B-V")
+        bv_e = _maybe_float(row, "e_B-V")
+        if v is not None and bv is not None:
+            b_e = float(np.sqrt((v_e or 0.0) ** 2 + (bv_e or 0.0) ** 2)) or 0.03
+            b = float(v) + float(bv)
+            _add_mag(mag_dict, "GROUND_JOHNSON_B", b, b_e)
+            ub = _maybe_float(row, "U-B")
+            ub_e = _maybe_float(row, "e_U-B")
+            if ub is not None:
+                u_e = float(np.sqrt(b_e**2 + (ub_e or 0.0) ** 2)) or 0.03
+                _add_mag(mag_dict, "GROUND_JOHNSON_U", b + float(ub), u_e)
+    return mag_dict
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_skymapper_observables(ra_deg: float, dec_deg: float) -> dict:
+    return _download_vizier_observables(
+        ra_deg,
+        dec_deg,
+        "II/379/smssdr4",
+        [
+            ("SkyMapper_u", "uPSF", "e_uPSF"),
+            ("SkyMapper_v", "vPSF", "e_vPSF"),
+            ("SkyMapper_g", "gPSF", "e_gPSF"),
+            ("SkyMapper_r", "rPSF", "e_rPSF"),
+            ("SkyMapper_i", "iPSF", "e_iPSF"),
+            ("SkyMapper_z", "zPSF", "e_zPSF"),
+        ],
+    )
+
+
+def _source_subset(mag_dict: dict, bands: list[str]) -> dict:
+    return {band: mag_dict[band] for band in bands if band in mag_dict}
+
+
+def _merge_source(target: dict, source_by_band: dict, source_name: str, values: dict, allowed_bands: list[str]) -> None:
+    for band, value in values.items():
+        if band in allowed_bands and band not in target:
+            target[band] = value
+            source_by_band[band] = source_name
+
+
+def filter_fit_magnitudes(mag_dict: dict, fit_sources: tuple[str, ...]) -> dict:
+    fit_bands = set()
+    for source in fit_sources:
+        fit_bands.update(PHOTOMETRY_SOURCE_BANDS[source])
+    return {band: value for band, value in mag_dict.items() if band in fit_bands}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def download_observables(
+    ra_deg: float,
+    dec_deg: float,
+    gaia_dr3_id: int | None,
+    retrieve_sources: tuple[str, ...],
+) -> dict:
     gaia = download_gaia_observables(gaia_dr3_id)
     query_ra = gaia["ra_deg"] or ra_deg
     query_dec = gaia["dec_deg"] or dec_deg
     mag_dict = {}
-    mag_dict.update(gaia["mag_dict"])
-    mag_dict.update(download_2mass_observables(query_ra, query_dec))
-    mag_dict.update(download_wise_observables(query_ra, query_dec))
+    source_by_band = {}
+
+    if "gaia" in retrieve_sources:
+        _merge_source(mag_dict, source_by_band, "Gaia", gaia["mag_dict"], PHOTOMETRY_SOURCE_BANDS["gaia"])
+    if "2mass" in retrieve_sources:
+        _merge_source(mag_dict, source_by_band, "2MASS", download_2mass_observables(query_ra, query_dec), PHOTOMETRY_SOURCE_BANDS["2mass"])
+    if "wise12" in retrieve_sources or "wise34" in retrieve_sources:
+        wise = download_wise_observables(query_ra, query_dec)
+        if "wise12" in retrieve_sources:
+            _merge_source(mag_dict, source_by_band, "AllWISE", wise, PHOTOMETRY_SOURCE_BANDS["wise12"])
+        if "wise34" in retrieve_sources:
+            _merge_source(mag_dict, source_by_band, "AllWISE", wise, PHOTOMETRY_SOURCE_BANDS["wise34"])
+    if "panstarrs" in retrieve_sources:
+        _merge_source(mag_dict, source_by_band, "Pan-STARRS", download_panstarrs_observables(query_ra, query_dec), PHOTOMETRY_SOURCE_BANDS["panstarrs"])
+    if "sdss" in retrieve_sources:
+        _merge_source(mag_dict, source_by_band, "SDSS", download_sdss_observables(query_ra, query_dec), PHOTOMETRY_SOURCE_BANDS["sdss"])
+    if "skymapper" in retrieve_sources:
+        _merge_source(mag_dict, source_by_band, "SkyMapper", download_skymapper_observables(query_ra, query_dec), PHOTOMETRY_SOURCE_BANDS["skymapper"])
+    if "apass" in retrieve_sources:
+        _merge_source(mag_dict, source_by_band, "APASS", download_apass_observables(query_ra, query_dec), PHOTOMETRY_SOURCE_BANDS["apass"])
+    if "tycho" in retrieve_sources:
+        _merge_source(mag_dict, source_by_band, "Tycho-2", download_tycho_observables(query_ra, query_dec), PHOTOMETRY_SOURCE_BANDS["tycho"])
+    if "galex" in retrieve_sources:
+        _merge_source(mag_dict, source_by_band, "GALEX", download_galex_observables(query_ra, query_dec), PHOTOMETRY_SOURCE_BANDS["galex"])
+    if "johnson" in retrieve_sources:
+        _merge_source(mag_dict, source_by_band, "Johnson UBV", download_johnson_observables(query_ra, query_dec), PHOTOMETRY_SOURCE_BANDS["johnson"])
 
     return {
         "mag_dict": mag_dict,
+        "source_by_band": source_by_band,
         "plx": gaia["plx"],
         "plx_e": gaia["plx_e"],
         "dist": gaia["dist"],
@@ -662,7 +951,9 @@ def build_star(
         )
 
 
-def photometry_dataframe(star) -> pd.DataFrame:
+def photometry_dataframe(star, fit_bands: set[str] | None = None, source_by_band: dict | None = None) -> pd.DataFrame:
+    fit_bands = fit_bands or set()
+    source_by_band = source_by_band or {}
     rows = []
     for band in ARIADNE_BANDS:
         idx = np.where(star.filter_names == band)[0]
@@ -670,24 +961,26 @@ def photometry_dataframe(star) -> pd.DataFrame:
             continue
         i = int(idx[0])
         used = bool(star.used_filters[i] == 1)
+        fit_used = used and band in fit_bands
         rows.append(
             {
                 "Band": DISPLAY_NAMES.get(band, band),
                 "ARIADNE filter": band,
+                "Source": source_by_band.get(band, ""),
                 "Magnitude": np.nan if not used else float(star.mags[i]),
                 "Magnitude error": np.nan if not used else float(star.mag_errs[i]),
                 "Wavelength (um)": np.nan if not used else float(star.wave[i]),
                 "Band half-width (um)": np.nan if not used else float(star.bandpass[i]),
                 "Flux": np.nan if not used else float(star.flux[i]),
                 "Flux error": np.nan if not used else float(star.flux_er[i]),
-                "Status": "found" if used else "missing",
+                "Status": "fit" if fit_used else ("display only" if used else "missing"),
             }
         )
     return pd.DataFrame(rows)
 
 
 def plot_sed(df: pd.DataFrame):
-    found = df[df["Status"] == "found"].copy()
+    found = df[df["Status"] != "missing"].copy()
     if found.empty:
         return None
     found["Flux x wavelength"] = found["Flux"] * found["Wavelength (um)"]
@@ -698,9 +991,12 @@ def plot_sed(df: pd.DataFrame):
         y="Flux x wavelength",
         error_x="Band half-width (um)",
         error_y="Flux error x wavelength",
-        color="Band",
+        color="Status",
+        symbol="Band",
         hover_data={
+            "Band": True,
             "ARIADNE filter": True,
+            "Source": True,
             "Magnitude": ":.4f",
             "Magnitude error": ":.4f",
             "Wavelength (um)": ":.4f",
@@ -1119,6 +1415,56 @@ with st.sidebar:
     dynamic = st.checkbox("Dynamic nested sampler", value=False)
 
     st.divider()
+    st.header("Photometry")
+    retrieve_defaults = {
+        "gaia": True,
+        "2mass": True,
+        "wise12": True,
+        "wise34": True,
+        "panstarrs": True,
+        "sdss": True,
+        "skymapper": True,
+        "apass": True,
+        "tycho": True,
+        "galex": False,
+        "johnson": True,
+    }
+    fit_defaults = {
+        "gaia": True,
+        "2mass": True,
+        "wise12": True,
+        "wise34": False,
+        "panstarrs": True,
+        "sdss": True,
+        "skymapper": False,
+        "apass": True,
+        "tycho": True,
+        "galex": False,
+        "johnson": True,
+    }
+    retrieve_sources = []
+    fit_sources = []
+    with st.expander("Photometry sources", expanded=False):
+        st.caption("Retrieve controls what is shown. Include in fit controls what ARIADNE uses.")
+        for source_key, label in PHOTOMETRY_SOURCE_LABELS.items():
+            retrieve = st.checkbox(
+                f"Retrieve {label}",
+                value=retrieve_defaults[source_key],
+                key=f"retrieve_{source_key}",
+            )
+            if retrieve:
+                retrieve_sources.append(source_key)
+            fit = st.checkbox(
+                f"Include {label} in fit",
+                value=fit_defaults[source_key],
+                key=f"fit_{source_key}",
+                disabled=not retrieve,
+                help="WISE W3/W4 is often useful for infrared-excess inspection but is off for fitting by default.",
+            )
+            if retrieve and fit:
+                fit_sources.append(source_key)
+
+    st.divider()
     if st.button("Download SFD dustmap", use_container_width=True):
         with st.spinner("Downloading SFD dustmap data..."):
             fetch_sfd_dustmap()
@@ -1131,6 +1477,12 @@ if "resolved" not in st.session_state:
     st.session_state.resolved = None
 if "star" not in st.session_state:
     st.session_state.star = None
+if "display_star" not in st.session_state:
+    st.session_state.display_star = None
+if "photometry_source_by_band" not in st.session_state:
+    st.session_state.photometry_source_by_band = {}
+if "fit_bands" not in st.session_state:
+    st.session_state.fit_bands = set()
 
 resolve_col, fit_col, bma_col = st.columns([1.1, 1, 1])
 with resolve_col:
@@ -1166,7 +1518,22 @@ if resolve_clicked:
                 st.write("No Gaia DR3 identifier found from SIMBAD; trying a Gaia cone search.")
 
             st.write("Querying Gaia DR3 for BP/G/RP photometry, parallax distance, and RUWE.")
-            gaia = download_gaia_observables(resolved["gaia_dr3_id"])
+            observables = download_observables(
+                resolved["ra_deg"],
+                resolved["dec_deg"],
+                resolved["gaia_dr3_id"],
+                tuple(retrieve_sources),
+            )
+            gaia = {
+                "mag_dict": _source_subset(observables["mag_dict"], PHOTOMETRY_SOURCE_BANDS["gaia"]),
+                "plx": observables["plx"],
+                "plx_e": observables["plx_e"],
+                "dist": observables["dist"],
+                "dist_e": observables["dist_e"],
+                "ruwe": observables["ruwe"],
+                "ra_deg": None,
+                "dec_deg": None,
+            }
             query_ra = gaia["ra_deg"] or resolved["ra_deg"]
             query_dec = gaia["dec_deg"] or resolved["dec_deg"]
             gaia_bands = [DISPLAY_NAMES[k] for k in ARIADNE_BANDS if k in gaia["mag_dict"]]
@@ -1180,34 +1547,22 @@ if resolve_clicked:
                 )
             )
 
-            st.write("Querying IRSA 2MASS PSC for J/H/Ks photometry.")
-            tmass = download_2mass_observables(query_ra, query_dec)
-            tmass_bands = [DISPLAY_NAMES[k] for k in ARIADNE_BANDS if k in tmass]
-            st.write("2MASS returned " + (", ".join(tmass_bands) if tmass_bands else "no requested photometry") + ".")
+            st.write("Querying selected photometry catalogs around the resolved coordinates.")
+            for source_key in retrieve_sources:
+                bands = [DISPLAY_NAMES[band] for band in PHOTOMETRY_SOURCE_BANDS[source_key] if band in observables["mag_dict"]]
+                st.write(f"{PHOTOMETRY_SOURCE_LABELS[source_key]} returned " + (", ".join(bands) if bands else "no requested photometry") + ".")
 
-            st.write("Querying IRSA AllWISE for W1/W2 photometry.")
-            wise = download_wise_observables(query_ra, query_dec)
-            wise_bands = [DISPLAY_NAMES[k] for k in ARIADNE_BANDS if k in wise]
-            st.write("AllWISE returned " + (", ".join(wise_bands) if wise_bands else "no requested photometry") + ".")
-
-            mag_dict = {}
-            mag_dict.update(gaia["mag_dict"])
-            mag_dict.update(tmass)
-            mag_dict.update(wise)
+            mag_dict = observables["mag_dict"]
+            fit_mag_dict = filter_fit_magnitudes(mag_dict, tuple(fit_sources))
             missing = [DISPLAY_NAMES[k] for k in ARIADNE_BANDS if k not in mag_dict]
             if missing:
                 st.write("Missing requested band(s): " + ", ".join(missing) + ".")
             else:
-                st.write("All requested Gaia, 2MASS, and WISE bands were found.")
-
-            observables = {
-                "mag_dict": mag_dict,
-                "plx": gaia["plx"],
-                "plx_e": gaia["plx_e"],
-                "dist": gaia["dist"],
-                "dist_e": gaia["dist_e"],
-                "ruwe": gaia["ruwe"],
-            }
+                st.write("All requested bands were found.")
+            fit_band_names = [DISPLAY_NAMES[k] for k in ARIADNE_BANDS if k in fit_mag_dict]
+            st.write("Fit will use " + (", ".join(fit_band_names) if fit_band_names else "no photometry bands") + ".")
+            if not fit_mag_dict:
+                raise RuntimeError("No selected photometry bands were retrieved for fitting. Enable more retrieve/include sources and try again.")
             resolved["ruwe"] = observables["ruwe"]
 
             st.write("Constructing the ARIADNE Star object and converting magnitudes to fluxes.")
@@ -1215,13 +1570,25 @@ if resolve_clicked:
                 st.write(
                     "No usable Gaia parallax distance is available, so the app will skip distance-dependent dust-map extinction for this target and let ARIADNE use its broad default distance prior during fitting."
                 )
+            display_star = build_star(
+                resolved["main_id"],
+                resolved["ra_deg"],
+                resolved["dec_deg"],
+                resolved["gaia_dr3_id"],
+                "SFD",
+                tuple(sorted(mag_dict.items())),
+                observables["plx"],
+                observables["plx_e"],
+                observables["dist"],
+                observables["dist_e"],
+            )
             star = build_star(
                 resolved["main_id"],
                 resolved["ra_deg"],
                 resolved["dec_deg"],
                 resolved["gaia_dr3_id"],
                 "SFD",
-                tuple(sorted(observables["mag_dict"].items())),
+                tuple(sorted(fit_mag_dict.items())),
                 observables["plx"],
                 observables["plx_e"],
                 observables["dist"],
@@ -1230,6 +1597,9 @@ if resolve_clicked:
             status.update(label="Photometry retrieval complete.", state="complete", expanded=False)
         st.session_state.resolved = resolved
         st.session_state.star = star
+        st.session_state.display_star = display_star
+        st.session_state.photometry_source_by_band = observables["source_by_band"]
+        st.session_state.fit_bands = set(fit_mag_dict)
         st.success(f"Resolved {resolved['main_id']}.")
     except FileNotFoundError as exc:
         st.error("The SFD dustmap data is not installed yet. Use the sidebar button to download it, then try again.")
@@ -1240,6 +1610,7 @@ if resolve_clicked:
 
 resolved = st.session_state.resolved
 star = st.session_state.star
+display_star = st.session_state.display_star or star
 
 if resolved and star:
     meta1, meta2, meta3, meta4, meta5 = st.columns(5)
@@ -1337,7 +1708,11 @@ if resolved and star:
                 st.error("The fit did not complete.")
                 st.exception(exc)
 
-    df = photometry_dataframe(star)
+    df = photometry_dataframe(
+        display_star,
+        fit_bands=st.session_state.fit_bands,
+        source_by_band=st.session_state.photometry_source_by_band,
+    )
     chart = plot_sed(df)
     if chart:
         st.plotly_chart(chart, use_container_width=True)
