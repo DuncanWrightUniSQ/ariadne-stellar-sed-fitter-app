@@ -487,15 +487,17 @@ def download_gaia_observables(gaia_dr3_id: int | None) -> dict:
                     mag_dict[band] = (float(row[mag_index]), _gaia_mag_error(row[snr_index]))
             ruwe = row[11]
 
+    usable_plx = float(plx) if plx is not None and plx > 0 else None
+    usable_plx_e = float(plx_e) if usable_plx is not None and plx_e is not None else None
     dist = dist_e = None
-    if plx is not None and plx > 0:
-        dist = 1000.0 / float(plx)
-        dist_e = abs(dist * float(plx_e or 0.0) / float(plx))
+    if usable_plx is not None:
+        dist = 1000.0 / usable_plx
+        dist_e = abs(dist * float(usable_plx_e or 0.0) / usable_plx)
 
     return {
         "mag_dict": mag_dict,
-        "plx": plx,
-        "plx_e": plx_e,
+        "plx": usable_plx,
+        "plx_e": usable_plx_e,
         "dist": dist,
         "dist_e": dist_e,
         "ruwe": float(ruwe) if ruwe is not None else None,
@@ -638,6 +640,10 @@ def build_star(
 ):
     Star, _, _ = _import_ariadne()
     mag_dict = dict(mag_items)
+    extinction_kwargs = {}
+    if dist is None:
+        extinction_kwargs["Av"] = 0.0
+        extinction_kwargs["Av_e"] = 0.0
     with contextlib.redirect_stdout(io.StringIO()):
         return Star(
             star_name,
@@ -652,6 +658,7 @@ def build_star(
             offline=True,
             dustmap=dustmap,
             verbose=False,
+            **extinction_kwargs,
         )
 
 
@@ -1204,6 +1211,10 @@ if resolve_clicked:
             resolved["ruwe"] = observables["ruwe"]
 
             st.write("Constructing the ARIADNE Star object and converting magnitudes to fluxes.")
+            if observables["dist"] is None:
+                st.write(
+                    "No usable Gaia parallax distance is available, so the app will skip distance-dependent dust-map extinction for this target and let ARIADNE use its broad default distance prior during fitting."
+                )
             star = build_star(
                 resolved["main_id"],
                 resolved["ra_deg"],
